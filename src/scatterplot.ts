@@ -30,6 +30,10 @@ const base_elements = [
     nodetype: 'canvas',
   },
   {
+    id: 'webgpu-canvas',
+    nodetype: 'canvas',
+  },
+  {
     id: 'canvas-2d',
     nodetype: 'canvas',
   },
@@ -631,6 +635,52 @@ export class Scatterplot {
    * upon the completion of the plot (not including any time for transitions).
    */
   async plotAPI(prefs: DS.APICall): Promise<void> {
+    if (prefs === undefined) {
+      return;
+    }
+    await this.plot_queue;
+
+    // Ensure that the deeptable exists.
+    if (this._root === undefined) {
+      const { source_url, arrow_table, arrow_buffer } =
+        prefs as DS.InitialAPICall;
+      const dataSpec = { source_url, arrow_table, arrow_buffer } as DS.DataSpec;
+      if (Object.values(dataSpec).filter((x) => x !== undefined).length !== 1) {
+        throw new Error(
+          'The initial API call specify exactly one of source_url, arrow_table, or arrow_buffer',
+        );
+      }
+      await this.load_deeptable(dataSpec);
+    }
+    this.update_prefs(prefs);
+    // Then ensure the renderer and interaction handlers exist.
+    if (this._zoom === undefined || this._renderer === undefined) {
+      await this.reinitialize();
+    }
+    if (prefs) {
+      await this.start_transformations(prefs);
+    }
+
+    this.plot_queue = this.unsafe_plotAPI(prefs);
+
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    for (const [_, hook] of Object.entries(this.hooks)) {
+      hook();
+    }
+    return;
+  }
+
+  /**
+   * Parallel entry point to Scatterplot, mimicking the existing plotAPI but
+   * performing all rendering in WebGPU.
+   * The end goal is to include a 'WebGPU' rendering option in prefs to allow users to select between WebGL and WebGPU.
+   * This approach will be simpler to implement at first as I progress
+   * through learning WebGPU while maintaining the existing WebGL implementation.
+   *
+   * Plots a set of preferences (prefs) and returns a promise that resolves
+   * upon the completion of the plot (excluding any time for transitions).
+   */
+  async plotAPIWebGPU(prefs: DS.APICall): Promise<void> {
     if (prefs === undefined) {
       return;
     }
