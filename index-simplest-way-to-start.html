@@ -22,6 +22,7 @@
     point_size: 5, // Default point size before application of size scaling
     background_color: '#000000',
     click_function: (datum) => console.log({ ...datum }), // Overrides default click for easy customization
+    rendering_mode: 'webgpu',
 
     // encoding API based roughly on Vega Lite: https://vega.github.io/vega-lite/docs/encoding.html
     encoding: {

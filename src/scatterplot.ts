@@ -52,7 +52,7 @@ type Hook = () => void;
  * all data and renderering.
  */
 export class Scatterplot {
-  public _renderer?: ReglRenderer;
+  public _renderer?: ReglRenderer; //| WebGPURenderer;
   public width: number;
   public height: number;
   public _root?: Deeptable;
@@ -396,11 +396,22 @@ export class Scatterplot {
     const { prefs } = this;
     await this.deeptable.promise;
     await this.deeptable.root_tile.get_column('x');
-    this._renderer = new ReglRenderer(
-      '#container-for-webgl-canvas',
-      this.deeptable,
-      this,
-    );
+
+    //  check rendering mode or default to webgl
+    if (prefs.rendering_mode !== 'webgpu') {
+      this._renderer = new ReglRenderer(
+        '#container-for-webgl-canvas',
+        this.deeptable,
+        this,
+      );
+    } else {
+      // this._renderer = new WebGPURenderer(
+      //   '#container-for-webgpu-canvas',
+      //   this.deeptable,
+      //   this,
+      // );
+    }
+
     this._zoom = new Zoom('#deepscatter-svg', this.prefs, this);
     this._zoom.attach_tiles(this.deeptable);
     this._zoom.attach_renderer('regl', this._renderer);
@@ -633,6 +644,7 @@ export class Scatterplot {
   /**
    * Plots a set of prefs, and returns a promise that resolves
    * upon the completion of the plot (not including any time for transitions).
+   * now with 'webGPU' rendering option // work in progress
    */
   async plotAPI(prefs: DS.APICall): Promise<void> {
     if (prefs === undefined) {
@@ -669,53 +681,6 @@ export class Scatterplot {
     }
     return;
   }
-
-  /**
-   * Parallel entry point to Scatterplot, mimicking the existing plotAPI but
-   * performing all rendering in WebGPU.
-   * The end goal is to include a 'WebGPU' rendering option in prefs to allow users to select between WebGL and WebGPU.
-   * This approach will be simpler to implement at first as I progress
-   * through learning WebGPU while maintaining the existing WebGL implementation.
-   *
-   * Plots a set of preferences (prefs) and returns a promise that resolves
-   * upon the completion of the plot (excluding any time for transitions).
-   */
-  async plotAPIWebGPU(prefs: DS.APICall): Promise<void> {
-    if (prefs === undefined) {
-      return;
-    }
-    await this.plot_queue;
-
-    // Ensure that the deeptable exists.
-    if (this._root === undefined) {
-      const { source_url, arrow_table, arrow_buffer } =
-        prefs as DS.InitialAPICall;
-      const dataSpec = { source_url, arrow_table, arrow_buffer } as DS.DataSpec;
-      if (Object.values(dataSpec).filter((x) => x !== undefined).length !== 1) {
-        throw new Error(
-          'The initial API call specify exactly one of source_url, arrow_table, or arrow_buffer',
-        );
-      }
-      await this.load_deeptable(dataSpec);
-    }
-    this.update_prefs(prefs);
-    // Then ensure the renderer and interaction handlers exist.
-    if (this._zoom === undefined || this._renderer === undefined) {
-      await this.reinitialize();
-    }
-    if (prefs) {
-      await this.start_transformations(prefs);
-    }
-
-    this.plot_queue = this.unsafe_plotAPI(prefs);
-
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    for (const [_, hook] of Object.entries(this.hooks)) {
-      hook();
-    }
-    return;
-  }
-
   /**
    * Get a short head start on transformations. This prevents a flicker
    * when a new data field needs to be loaded onto the GPU.
@@ -934,6 +899,7 @@ abstract class SettableFunction<FuncType, ArgType = StructRowProxy> {
 
 import type { GeoJsonProperties } from 'geojson';
 import { default_API_call } from './defaults';
+import { WebGPURenderer } from './webgpu_rendering';
 
 class LabelClick extends SettableFunction<void, GeoJsonProperties> {
   default(

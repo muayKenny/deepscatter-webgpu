@@ -1,0 +1,1401 @@
+/* eslint-disable no-underscore-dangle */
+import wrapREGL, {
+  Framebuffer2D,
+  Regl,
+  Texture2D,
+  Buffer,
+  DrawCommand,
+  DrawConfig,
+  DefaultContext,
+} from 'regl';
+import { range, sum } from 'd3-array';
+import unpackFloat from 'glsl-read-float';
+import { Zoom } from './interaction';
+import { Renderer } from './rendering';
+//@ts-expect-error no glsl loader types.
+import gaussian_blur from './glsl/gaussian_blur.frag';
+//@ts-expect-error no glsl loader types.
+import vertex_shader from './glsl/general.vert';
+//@ts-expect-error no glsl loader types.
+import frag_shader from './glsl/general.frag';
+import { AestheticSet } from './aesthetics/AestheticSet';
+import { rgb } from 'd3-color';
+import type * as DS from './types';
+import type { Tile } from './tile';
+import REGL from 'regl';
+import { Deeptable } from './Deeptable';
+import {
+  ConcreteScaledAesthetic,
+  dimensions,
+} from './aesthetics/StatefulAesthetic';
+import { Scatterplot } from './scatterplot';
+import {
+  Data,
+  Dictionary,
+  Struct,
+  StructRowProxy,
+  Type,
+  Utf8,
+  Vector,
+} from 'apache-arrow';
+import { Color } from './aesthetics/ColorAesthetic';
+import { StatefulAesthetic } from './aesthetics/StatefulAesthetic';
+import { Filter, Foreground } from './aesthetics/BooleanAesthetic';
+import { ZoomTransform } from 'd3-zoom';
+import { Some, TupleMap, TupleSet } from './utilityFunctions';
+
+// placeholder to get started
+export async function initializeWebGPU(): Promise<GPUDevice | null> {
+  if (!navigator.gpu) {
+    console.error('WebGPU is not supported by your browser.');
+    return null;
+  }
+
+  const adapter: GPUAdapter | null = await navigator.gpu.requestAdapter();
+  if (!adapter) {
+    console.error('Failed to get GPU adapter.');
+    return null;
+  }
+
+  const device: GPUDevice = await adapter.requestDevice();
+  console.log('GPU device acquired:', device);
+  return device;
+}
+
+// eslint-disable-next-line import/prefer-default-export
+export class WebGPURenderer extends Renderer {
+  public regl: Regl;
+  public aes: AestheticSet;
+  public buffer_size = 1024 * 1024 * 64; // Use GPU memory in blocks of 64 MB buffers by default.
+  private _buffers: MultipurposeBufferSet;
+  public _initializations: Promise<void>;
+  public deeptable: Deeptable;
+  public _zoom?: Zoom;
+  public most_recent_restart?: number;
+  public _default_webgl_scale?: number[];
+  public _webgl_scale_history?: [number[], number[]];
+  public _renderer?: DrawCommand;
+  public _use_scale_to_download_tiles = true;
+  // public sprites?: d3.Selection<SVGElement, any, any, any>;
+  public fbos: Record<string, Framebuffer2D> = {};
+  public textures: Record<string, Texture2D> = {};
+  public _fill_buffer?: Buffer;
+  public contour_vals?: Uint8Array;
+  public contour_alpha_vals?: Float32Array | Uint8Array | Uint16Array;
+  public tick_num?: number;
+  public reglframe?: REGL.Cancellable;
+  public bufferManager: BufferManager;
+
+  private aes_to_buffer_num: TupleMap<string, number> = new TupleMap();
+  private variable_to_buffer_num?: TupleMap<string, number>;
+  private buffer_num_to_variable?: string[][];
+
+  //  public _renderer :  Renderer;
+
+  constructor(
+    selector: string | Node,
+    tileSet: Deeptable,
+    scatterplot: Scatterplot,
+  ) {
+    super(selector, scatterplot);
+
+    const c = this.canvas;
+    if (this.canvas === undefined) {
+      throw new Error('No canvas found');
+    }
+
+    this.regl = wrapREGL({
+      //      extensions: 'angle_instanced_arrays',
+      optionalExtensions: [
+        'OES_standard_derivatives',
+        'OES_element_index_uint',
+        'OES_texture_float',
+        'OES_texture_half_float',
+      ],
+      canvas: c,
+    });
+
+    this.deeptable = tileSet;
+
+    this.aes = new AestheticSet(scatterplot, this.regl, tileSet);
+
+    // allocate buffers in 64 MB blocks.
+    this.initialize_textures();
+
+    // Not the right way, for sure.
+    (this._initializations = this.deeptable.promise.then(() => {
+      this.remake_renderer();
+      this._webgl_scale_history = [
+        this.default_webgl_scale,
+        this.default_webgl_scale,
+      ];
+    })),
+      void this.initialize();
+    this._buffers = new MultipurposeBufferSet(this.regl, this.buffer_size);
+    this.bufferManager = new BufferManager(this);
+  }
+
+  get buffers() {
+    this._buffers =
+      this._buffers || new MultipurposeBufferSet(this.regl, this.buffer_size);
+    return this._buffers;
+  }
+
+  data(deeptable: Deeptable) {
+    if (deeptable === undefined) {
+      // throw
+      return this.deeptable;
+    }
+    this.deeptable = deeptable;
+    return this;
+  }
+
+  get props(): DS.GlobalDrawProps {
+    // Stuff needed for regl.
+
+    // Would be better cached per draw call.
+    this.allocate_aesthetic_buffers();
+    if (!this.zoom) {
+      throw new Error('Unable to draw before zoom state set up.');
+    }
+    if (!this.most_recent_restart)
+      throw new Error('Failed to populate restart');
+    const {
+      prefs,
+      aes_to_buffer_num,
+      buffer_num_to_variable,
+      variable_to_buffer_num,
+    } = this;
+    const transform: ZoomTransform = this.zoom
+      .transform as unknown as ZoomTransform;
+    const colorScales = this.aes.dim('color') as StatefulAesthetic<Color>;
+    const foreground = this.aes.dim(
+      'foreground',
+    ) as StatefulAesthetic<Foreground>;
+    const [currentColor, lastColor] = [
+      colorScales.current,
+      colorScales.last,
+    ] as [Color, Color];
+    // This allows us to wrap categorical scales according to the number
+    // of categories.
+    const wrap_colors_after = [
+      lastColor.colorscheme_size,
+      currentColor.colorscheme_size,
+    ] as [number, number];
+    const props: DS.GlobalDrawProps = {
+      // Copy the aesthetic as a string.
+      // aes: { encoding: this.aes.encoding },
+      colors_as_grid: 0,
+      corners: this.zoom.current_corners(),
+      zoom_balance: prefs.zoom_balance,
+      transform: transform,
+      max_ix: this.max_ix,
+      point_size: this.point_size,
+      alpha: this.optimal_alpha,
+      time: Date.now() - this.zoom._start,
+      update_time: Date.now() - this.most_recent_restart,
+      relative_time: (Date.now() - this.most_recent_restart) / prefs.duration,
+      // string_index: 0,
+      prefs: JSON.parse(JSON.stringify(prefs)) as DS.APICall,
+      wrap_colors_after,
+      background_draw_needed: [
+        foreground.last.active,
+        foreground.current.active,
+      ] as [boolean, boolean],
+      start_time: this.most_recent_restart,
+      webgl_scale: this._webgl_scale_history[0],
+      last_webgl_scale: this._webgl_scale_history[1],
+      use_scale_for_tiles: this._use_scale_to_download_tiles,
+      grid_mode: 0,
+      buffer_num_to_variable: buffer_num_to_variable,
+      aes_to_buffer_num,
+      variable_to_buffer_num: variable_to_buffer_num,
+      color_picker_mode: 0, // whether to draw as a color picker.
+      position_interpolation: this.aes.position_interpolation,
+      zoom_matrix: [
+        [transform.k, 0, transform.x],
+        [0, transform.k, transform.y],
+        [0, 0, 1],
+      ].flat() as [
+        number,
+        number,
+        number,
+        number,
+        number,
+        number,
+        number,
+        number,
+        number,
+      ],
+    };
+
+    // Clone.
+    //    return JSON.parse(JSON.stringify(props)) as DS.GlobalDrawProps;
+    return props;
+  }
+
+  get default_webgl_scale() {
+    if (this._default_webgl_scale) {
+      return this._default_webgl_scale;
+    }
+    this._default_webgl_scale = this.zoom.webgl_scale();
+    return this._default_webgl_scale;
+  }
+
+  render_points(props: DS.GlobalDrawProps) {
+    // Regl is faster if it can render a large number of draw calls together.
+    const prop_list: DS.TileDrawProps[] = [];
+    let call_no = 0;
+    const needs_background_pass =
+      props.background_draw_needed[0] || props.background_draw_needed[1];
+    for (const tile of this.visible_tiles()) {
+      // Do the binding operation; returns truthy if it's already done.
+      if (!this.bufferManager.ready(tile, this.aes.neededFields)) {
+        continue;
+      }
+
+      const this_props = {
+        number: call_no++,
+        foreground_draw_number: needs_background_pass ? 1 : 1,
+        tile_id: tile.numeric_id,
+        tile: tile,
+        count: tile.manifest.nPoints,
+        ...props,
+      } as DS.TileDrawProps;
+      prop_list.push(this_props);
+      if (needs_background_pass) {
+        const background_props = {
+          ...this_props,
+          foreground_draw_number: 0,
+        } as const;
+        prop_list.push(background_props);
+      }
+    }
+    // Plot background first, and lower tiles before higher tiles.
+    prop_list.sort((a, b) => {
+      return (
+        (3 + a.foreground_draw_number) * 1000 -
+        (3 + b.foreground_draw_number) * 1000 +
+        b.tile_id -
+        a.tile_id
+      );
+    });
+    this._renderer(prop_list);
+  }
+
+  /**
+   * Actions that run on every single animation tick.
+   */
+  tick() {
+    // Kind of hacky, but done rather than a full async rewrite. If the webgl
+    // history isn't defined, this._initializations hasn't yet resolved and
+    // we'll see errors on drawing.
+    if (this._webgl_scale_history === undefined) {
+      return;
+    }
+
+    const { prefs, deeptable, props } = this;
+    this.tick_num = this.tick_num || 0;
+    this.tick_num++;
+    // Set a download call in motion.
+    if (this._use_scale_to_download_tiles) {
+      deeptable.spawnDownloads(
+        this.zoom.current_corners(),
+        this.props.max_ix,
+        5,
+        this.aes.neededFields.map((x) => x[0]),
+        'high',
+      );
+    } else {
+      // console.warn("No good rules here yet.")
+      deeptable.spawnDownloads(
+        undefined,
+        prefs.max_points,
+        5,
+        this.aes.neededFields.map((x) => x[0]),
+        'high',
+      );
+    }
+
+    try {
+      this.render_all(props);
+    } catch (error) {
+      this.reglframe.cancel();
+      throw error;
+    }
+  }
+
+  single_blur_pass(
+    fbo1: Framebuffer2D,
+    fbo2: Framebuffer2D,
+    direction: [number, number],
+  ) {
+    const { regl } = this;
+    fbo2.use(() => {
+      regl.clear({ color: [0, 0, 0, 0] });
+      regl({
+        frag: gaussian_blur as string,
+        uniforms: {
+          iResolution: ({ viewportWidth, viewportHeight }) => [
+            viewportWidth,
+            viewportHeight,
+          ],
+          iChannel0: fbo1,
+          direction,
+        },
+        /* blend: {
+          enable: true,
+          func: {
+            srcRGB: 'one',
+            srcAlpha: 'one',
+            dstRGB: 'one minus src alpha',
+            dstAlpha: 'one minus src alpha',
+          },
+        }, */
+        vert: `
+          precision mediump float;
+          attribute vec2 position;
+          varying vec2 uv;
+          void main() {
+            uv = 0.5 * (position + 1.0);
+            gl_Position = vec4(position, 0, 1);
+          }`,
+        attributes: {
+          position: [-4, -4, 4, -4, 0, 4],
+        },
+        depth: { enable: false },
+        count: 3,
+      })();
+    });
+  }
+
+  blur(fbo1: Framebuffer2D, fbo2: Framebuffer2D, passes = 3) {
+    let remaining = passes - 1;
+    while (remaining > -1) {
+      this.single_blur_pass(fbo1, fbo2, [2 ** remaining, 0]);
+      this.single_blur_pass(fbo2, fbo1, [0, 2 ** remaining]);
+      remaining -= 1;
+    }
+  }
+
+  render_all(props: DS.GlobalDrawProps) {
+    const { regl } = this;
+
+    this.fbos.points.use(() => {
+      regl.clear({ color: [0, 0, 0, 0] });
+      this.render_points(props);
+    });
+    /*
+      if (this.geolines) {
+        this.fbos.lines.use(() => {
+          regl.clear({ color: [0, 0, 0, 0] });
+          this.geolines.render(props);
+        });
+      }
+  
+      if (this.geo_polygons && this.geo_polygons.length) {
+        this.fbos.lines.use(() => {
+          regl.clear({ color: [0, 0, 0, 0] });
+          for (const handler of this.geo_polygons) {
+            handler.render(props);
+          }
+        });
+      }
+      */
+    regl.clear({ color: [0, 0, 0, 0] });
+
+    this.fbos.lines.use(() => regl.clear({ color: [0, 0, 0, 0] }));
+    // if (this.scatterplot.trimap) {
+    //   // Allows binding a TriMap from `trifeather` object to the regl package without any import.
+    //   // This is the best way to do it that I can think of for now.
+    //   this.fbos.lines.use(() => {
+    //     //@ts-ignore
+    //     this.scatterplot.trimap.zoom = this.zoom;
+    //     //@ts-ignore
+    //     this.scatterplot.trimap.tick('polygon');
+    //   });
+    // }
+
+    // Copy the points buffer to the main buffer.
+
+    for (const layer of [this.fbos.lines, this.fbos.points]) {
+      regl({
+        profile: true,
+        blend: {
+          enable: true,
+          func: {
+            srcRGB: 'one',
+            srcAlpha: 'one',
+            dstRGB: 'one minus src alpha',
+            dstAlpha: 'one minus src alpha',
+          },
+        },
+        frag: `
+          precision mediump float;
+          varying vec2 uv;
+          uniform sampler2D tex;
+          uniform float wRcp, hRcp;
+          void main() {
+            gl_FragColor = texture2D(tex, uv);
+          }
+        `,
+        vert: `
+          precision mediump float;
+          attribute vec2 position;
+          varying vec2 uv;
+          void main() {
+            uv = 0.5 * (position + 1.0);
+            gl_Position = vec4(position, 0., 1.);
+          }
+        `,
+        attributes: {
+          position: this.fill_buffer,
+        },
+        depth: { enable: false },
+        count: 3,
+        uniforms: {
+          tex: () => layer,
+          wRcp: ({ viewportWidth }) => 1 / viewportWidth,
+          hRcp: ({ viewportHeight }) => 1 / viewportHeight,
+        },
+      })();
+    }
+  }
+
+  initialize_textures() {
+    const { regl } = this;
+    this.fbos = this.fbos || {};
+    this.textures = this.textures || {};
+    this.textures.empty_texture = regl.texture(
+      range(128).map(() => range(128).map(() => [0, 0, 0])),
+    );
+
+    this.fbos.minicounter = regl.framebuffer({
+      width: 512,
+      height: 512,
+      depth: false,
+    });
+
+    this.fbos.lines = regl.framebuffer({
+      // type: 'half float',
+      width: this.width,
+      height: this.height,
+      depth: false,
+    });
+
+    this.fbos.points = regl.framebuffer({
+      // type: 'half float',
+      width: this.width,
+      height: this.height,
+      depth: false,
+    });
+    this.fbos.ping = regl.framebuffer({
+      width: this.width,
+      height: this.height,
+      depth: false,
+    });
+
+    this.fbos.pong = regl.framebuffer({
+      width: this.width,
+      height: this.height,
+      depth: false,
+    });
+
+    this.fbos.contour =
+      this.fbos.contour ||
+      regl.framebuffer({
+        width: this.width,
+        height: this.height,
+        depth: false,
+      });
+
+    this.fbos.colorpicker =
+      this.fbos.colorpicker ||
+      regl.framebuffer({
+        width: this.width,
+        height: this.height,
+        depth: false,
+      });
+
+    this.fbos.dummy =
+      this.fbos.dummy ||
+      regl.framebuffer({
+        width: 1,
+        height: 1,
+        depth: false,
+      });
+  }
+
+  get_image_texture(url: string) {
+    const { regl } = this;
+    this.textures = this.textures || {};
+    if (this.textures[url]) {
+      return this.textures[url];
+    }
+    const image = new Image();
+    image.src = url;
+    //    this.textures[url] = this.fbos.minicounter;
+    image.addEventListener('load', () => {
+      this.textures[url] = regl.texture(image);
+    });
+    return this.textures[url];
+  }
+
+  n_visible(only_color = -1): number {
+    let { width, height } = this;
+    width = Math.floor(width);
+    height = Math.floor(height);
+    if (this.contour_vals === undefined) {
+      this.contour_vals = new Uint8Array(width * height * 4);
+    }
+
+    const { props } = this;
+    props.only_color = only_color;
+    let v: number = -1;
+    this.fbos.contour.use(() => {
+      this.regl.clear({ color: [0, 0, 0, 0] });
+      // read onto the contour vals.
+      this.render_points(props);
+      this.regl.read(this.contour_vals);
+      // Could be done faster on the GPU itself.
+      // But would require writing to float textures, which
+      // can be hard.
+      v = sum(this.contour_vals);
+    });
+    return v;
+  }
+
+  color_pick(x: number, y: number): null | StructRowProxy {
+    if (y === 0) {
+      // Not sure why, but this makes things complainy.
+      // console.warn('that thing again.');
+      return null;
+    }
+    const tile_number = this.color_pick_single(x, y, 'tile_id');
+    if (tile_number == -1) {
+      // Bail immediately to avoid wasting a draw call.
+      return null;
+    }
+    const row_number = this.color_pick_single(x, y, 'ix_in_tile');
+    if (row_number === -1) {
+      return null;
+    }
+    for (const tile of this.visible_tiles()) {
+      if (tile.numeric_id === tile_number) {
+        return tile.record_batch.get(row_number);
+      }
+    }
+    return null;
+    //    const p = this.tileSet.findPoint(point_as_int);
+    //    if (p.length === 0) { return; }
+    //    return p[0];
+  }
+
+  color_pick_single(
+    x: number,
+    y: number,
+    field: 'ix_in_tile' | 'ix' | 'tile_id' = 'tile_id',
+  ) {
+    const { props, height } = this;
+    props.color_picker_mode = (['ix', 'tile_id', 'ix_in_tile'].indexOf(field) +
+      1) as 1 | 2 | 3;
+
+    let color_at_point: [number, number, number, number] = [0, 0, 0, 0];
+    this.fbos.colorpicker.use(() => {
+      this.regl.clear({ color: [0, 0, 0, 0] });
+      // read onto the contour vals.
+      this.render_points(props);
+      // Must be flipped
+      try {
+        color_at_point = this.regl.read({
+          x,
+          y: height - y,
+          width: 1,
+          height: 1,
+        }) as unknown as [number, number, number, number];
+      } catch {
+        console.warn('Read bad data from', {
+          x,
+          y,
+          height,
+          attempted: height - y,
+        });
+      }
+    });
+    // Subtract one. This inverts the operation `fill = packFloat(ix + 1.);`
+    // in glsl/general.vert, to avoid off-by-one errors with the point selected.
+
+    const point_as_float = unpackFloat(...color_at_point) - 1;
+    // Coerce to int. unpackFloat returns float but findPoint expects int.
+    const point_as_int = Math.round(point_as_float);
+
+    return point_as_int;
+  }
+
+  get fill_buffer() {
+    //
+    if (!this._fill_buffer) {
+      const { regl } = this;
+      this._fill_buffer = regl.buffer({ data: [-4, -4, 4, -4, 0, 4] });
+    }
+    return this._fill_buffer;
+  }
+
+  draw_contour_buffer(field: string, ix: number) {
+    let { width, height } = this;
+    width = Math.floor(width);
+    height = Math.floor(height);
+
+    this.contour_vals = this.contour_vals || new Uint8Array(4 * width * height);
+    this.contour_alpha_vals =
+      this.contour_alpha_vals || new Uint16Array(width * height);
+
+    const { props } = this;
+
+    // props.aes.encoding.color = {
+    //   field,
+
+    // };
+
+    props.only_color = ix;
+
+    this.fbos.contour.use(() => {
+      this.regl.clear({ color: [0, 0, 0, 0] });
+      // read onto the contour vals.
+      this.render_points(props);
+      this.regl.read(this.contour_vals);
+    });
+
+    // 3-pass blur
+    this.blur(this.fbos.contour, this.fbos.ping, 3);
+
+    this.fbos.contour.use(() => {
+      this.regl.read(this.contour_vals);
+    });
+
+    let i = 0;
+
+    while (i < width * height * 4) {
+      this.contour_alpha_vals[i / 4] = this.contour_vals[i + 3] * 255;
+      i += 4;
+    }
+    return this.contour_alpha_vals;
+  }
+
+  remake_renderer() {
+    const { regl } = this;
+    // This should be scoped somewhere to allow resizing.
+    type P = DS.TileDrawProps;
+    type C = DefaultContext;
+    const parameters: DrawConfig<unknown, unknown, DS.TileDrawProps> = {
+      depth: { enable: false },
+      stencil: { enable: false },
+      blend: {
+        //@ts-expect-error Behavior of regl not working here.
+        enable(_: unknown, { color_picker_mode }) {
+          return (color_picker_mode as number) < 0.5;
+        },
+        func: {
+          srcRGB: 'one',
+          srcAlpha: 'one',
+          dstRGB: 'one minus src alpha',
+          dstAlpha: 'one minus src alpha',
+        },
+      },
+      primitive: 'points',
+      frag: frag_shader as string,
+      vert: vertex_shader as string,
+      count(_, props) {
+        return props.count;
+      },
+      attributes: {},
+      uniforms: {
+        //@ts-expect-error Doesn't know about regl.
+        u_update_time: regl.prop('update_time'),
+        u_transition_duration(_, props: P) {
+          return props.prefs.duration; // Using seconds, not milliseconds, in there
+        },
+        u_only_color(_: C, props: P) {
+          if (props.only_color !== undefined) {
+            return props.only_color;
+          }
+          // Use -2 to disable color plotting. -1 is a special
+          // value to plot all.
+          // Other values plot a specific value of the color-encoded field.
+          return -2;
+        },
+        u_wrap_colors_after: (_: unknown, { wrap_colors_after }: P) => {
+          if (wrap_colors_after === undefined) {
+            throw new Error('wrap_colors_after is undefined');
+          }
+          return wrap_colors_after;
+        },
+        // u_use_glyphset: (_, { prefs }: P) => (prefs.glyph_set ? 1 : 0),
+        // u_glyphset: (_, { prefs }) => {
+        //   if (prefs.glyph_set) {
+        //     return this.get_image_texture(prefs.glyph_set);
+        //   }
+        //   return this.textures.empty_texture;
+        // },
+
+        u_color_picker_mode: (_: Color, { color_picker_mode }: P) =>
+          color_picker_mode,
+        u_position_interpolation_mode(_, props: P) {
+          // 1 indicates that there should be a continuous loop between the two points.
+          if (props.position_interpolation) {
+            return 1;
+          }
+          return 0;
+        },
+        u_grid_mode: (_: C, { grid_mode }: P) => grid_mode,
+        u_colors_as_grid: (_, { colors_as_grid }: P) => colors_as_grid,
+        /*        u_constant_color: () => (this.aes.dim("color").current.constant !== undefined
+            ? this.aes.dim("color").current.constant
+            : [-1, -1, -1]),
+          u_constant_last_color: () => (this.aes.dim("color").last.constant !== undefined
+            ? this.aes.dim("color").last.constant
+            : [-1, -1, -1]),*/
+        u_tile_id: (_: C, props: P) => props.tile_id,
+        u_width: ({ viewportWidth }: C) => viewportWidth,
+        u_height: ({ viewportHeight }: C) => viewportHeight,
+        u_one_d_aesthetic_map: this.aes.aesthetic_map.one_d_texture,
+        u_color_aesthetic_map: this.aes.aesthetic_map.color_texture,
+        u_aspect_ratio: ({ viewportWidth, viewportHeight }: C) =>
+          viewportWidth / viewportHeight,
+        //@ts-expect-error Don't know about regl props.
+        u_zoom_balance: regl.prop('zoom_balance'),
+        u_base_size: (_: C, { point_size }: P) => point_size,
+        u_maxix: (_: C, { max_ix }: P) => max_ix,
+        u_alpha: (_: C, { alpha }: P) => {
+          return alpha;
+        },
+        u_background_draw_needed: (_: C, { background_draw_needed }: P) => {
+          return [
+            background_draw_needed[0] ? 1 : 0,
+            background_draw_needed[1] ? 1 : 0,
+          ];
+        },
+        u_foreground_number: (_: C, { foreground_draw_number }: P) =>
+          foreground_draw_number as number,
+        u_foreground_alpha: () => this.render_props.foreground_opacity,
+        u_background_rgba: () => {
+          const color = this.prefs.background_options.color;
+          const { r, g, b } = rgb(color);
+          return [
+            r / 255,
+            g / 255,
+            b / 255,
+            this.prefs.background_options.opacity[0],
+          ] as [number, number, number, number];
+        },
+        u_background_mouseover: () =>
+          this.prefs.background_options.mouseover ? 1 : 0,
+        u_background_size: () => this.render_props.background_size,
+        u_foreground_size: () => this.render_props.foreground_size,
+        u_k: (_: DefaultContext, props: P) => {
+          return props.transform.k;
+        },
+        // Allow interpolation between different coordinate systems.
+        //@ts-expect-error Don't know about regl props.
+        u_window_scale: regl.prop('webgl_scale'),
+        //@ts-expect-error Don't know about regl props.
+        u_last_window_scale: regl.prop('last_webgl_scale'),
+        u_time: ({ time }: P) => time,
+        u_jitter: () => this.aes.jitter_int_format('current'),
+        u_last_jitter: () => this.aes.jitter_int_format('last'),
+        u_zoom(_: C, props: P) {
+          return props.zoom_matrix;
+        },
+      },
+    };
+
+    // Define the operations to be implemented for the filter types.
+    for (const dim of ['filter', 'filter2', 'foreground']) {
+      const d = this.aes.dim(dim) as StatefulAesthetic<Foreground | Filter>;
+      for (const time of [
+        ['', 'current'],
+        ['last_', 'last'],
+      ] as const) {
+        parameters.uniforms[`u_${time[0]}${dim}_numeric`] = () => {
+          const ops = d[time[1]].ops_to_array();
+          return ops;
+        };
+      }
+    }
+    // store needed buffers
+    for (const i of range(0, 16)) {
+      parameters.attributes[`buffer_${i}`] = (
+        _,
+        { tile, buffer_num_to_variable }: P,
+      ) => {
+        if (i >= buffer_num_to_variable.length) {
+          return { constant: 0 };
+        }
+        const c = this.bufferManager.get([tile, ...buffer_num_to_variable[i]]);
+        return c || { constant: 0 };
+      };
+    }
+
+    for (const dim of [
+      'x',
+      'y',
+      'color',
+      'jitter_radius',
+      'x0',
+      'y0',
+      'jitter_speed',
+      'size',
+      'filter',
+      'filter2',
+      'foreground',
+    ] as const) {
+      const d = this.aes.store[dim];
+      for (const time of ['current', 'last'] as const) {
+        const temporal = time === 'current' ? '' : 'last_';
+        parameters.uniforms[`u_${temporal}${dim}_map_position`] = () => {
+          return d[time].map_position;
+        };
+        parameters.uniforms[`u_${temporal}${dim}_buffer_num`] = (
+          _,
+          { aes_to_buffer_num }: P,
+        ) => {
+          const val = aes_to_buffer_num.get([dim, time]);
+          if (val === undefined) {
+            return -1;
+          }
+          return val;
+        };
+        parameters.uniforms[`u_${temporal}${dim}_constant`] = () => {
+          const dim = d[time];
+          return dim.webGLconstant;
+        };
+        if (dim === 'filter' || dim === 'filter2' || dim === 'foreground') {
+          //pass
+        } else {
+          const scaled_d = d as StatefulAesthetic<ConcreteScaledAesthetic>;
+          parameters.uniforms[`u_${temporal}${dim}_domain`] = () =>
+            scaled_d[time].webGLDomain;
+          parameters.uniforms[`u_${temporal}${dim}_range`] = () =>
+            scaled_d[time].range;
+          parameters.uniforms[`u_${temporal}${dim}_transform`] = () => {
+            const t = scaled_d[time].transform;
+            if (t === 'linear') return 1;
+            else if (t === 'sqrt') return 2;
+            else if (t === 'log') return 3;
+            else if (t === 'literal') return 4;
+            else
+              throw new Error(
+                `Invalid transform for ${dim} of ${scaled_d[time].transform}`,
+              );
+          };
+        }
+      }
+      // Copy the parameters from the data name.
+    }
+    this._renderer = regl(parameters);
+    return this._renderer;
+  }
+
+  public allocate_aesthetic_buffers() {
+    // There are only 14 attribute buffers available to use,
+    // once we pass in the index and position in the tile. The order here determines
+    // how important it is to capture transitions for them; if
+    // we run out of buffers, the previous state of the requested aesthetic will just be thrown
+    // away.
+
+    type BufferSummary = {
+      aesthetic: string & keyof typeof dimensions;
+      time: 'current' | 'last';
+      field: Some<string>;
+    };
+    const buffers: BufferSummary[] = [];
+    const priorities: (string & keyof typeof dimensions)[] = [
+      'x',
+      'y',
+      'color',
+      'x0',
+      'y0',
+      'size',
+      'jitter_radius',
+      'jitter_speed',
+      'filter',
+      'filter2',
+      'foreground',
+    ];
+    for (const aesthetic of priorities) {
+      const times = ['current', 'last'] as const;
+      for (const time of times) {
+        try {
+          if (this.aes.dim(aesthetic)[time].field) {
+            buffers.push({
+              aesthetic,
+              time,
+              field: [
+                this.aes.dim(aesthetic)[time].field,
+                ...this.aes.dim(aesthetic)[time].subfield,
+              ],
+            });
+          }
+        } catch (error) {
+          // this.reglframe.cancel();
+          this.reglframe = undefined;
+          throw error;
+        }
+      }
+    }
+
+    buffers.sort((a, b) => {
+      // Current values always come first.
+      if (a.time < b.time) {
+        return -1;
+      } // current < last.
+      if (b.time < a.time) {
+        return 1;
+      }
+      return priorities.indexOf(a.aesthetic) - priorities.indexOf(b.aesthetic);
+    });
+
+    const aes_to_buffer_num: TupleMap<string, number> = new TupleMap([]);
+
+    // Pre-allocate the 'ix' buffer and the 'ix_in_tile' buffers.
+    const variable_to_buffer_num: TupleMap<string, number> = new TupleMap([
+      [['ix'], 0],
+      [['ix_in_tile'], 1],
+    ]); // eg 'year' =>  3
+    let num = 1;
+    for (const { aesthetic, time, field } of buffers) {
+      const k: Some<string> = [aesthetic, time];
+      // console.log({ field });
+      if (variable_to_buffer_num.get(field) !== undefined) {
+        aes_to_buffer_num.set(k, variable_to_buffer_num.get(field));
+        continue;
+      }
+      if (num++ < 16) {
+        aes_to_buffer_num.set(k, num);
+        variable_to_buffer_num.set(field, num);
+        continue;
+      } else {
+        console.log('Overflow');
+        // Don't use the last value, use the current value.
+        // Loses animation but otherwise plots nicely.
+        // Strategy will break if more than 14 base channels are defined,
+        // which is not currently possible.
+        aes_to_buffer_num.set(
+          [aesthetic, 'last'],
+          aes_to_buffer_num.get([aesthetic, 'current']),
+        );
+      }
+    }
+
+    // Store our maps on the object.
+    this.aes_to_buffer_num = aes_to_buffer_num;
+    this.variable_to_buffer_num = variable_to_buffer_num;
+
+    // Build up a a list of which variable is at which buffer number.
+    const buffer_num_to_variable_vs = [...variable_to_buffer_num.entries()];
+    buffer_num_to_variable_vs.sort((a, b) => a[1] - b[1]);
+    const buffer_num_to_variable = buffer_num_to_variable_vs.map((d) => d[0]);
+    this.buffer_num_to_variable = buffer_num_to_variable;
+  }
+
+  get discard_share() {
+    // If jitter is temporal, e.g., or filters are in place,
+    // it may make sense to estimate the number of hidden points.
+    return 0;
+  }
+}
+
+export class BufferManager {
+  // Handle the interactions of tiles with a regl state.
+
+  // binds elements directly to the tile, so it's safe
+  // to re-run this multiple times on the same tile.
+
+  // In an ideal world, these might all be methods directly on tile,
+  // but since they relate to Regl,
+  // I want them in this file instead.
+
+  private regl: Regl;
+  public renderer: ReglRenderer;
+  private bufferMap: WeakMap<ArrayBufferView, DS.BufferLocation> = new Map();
+  private arrayMap: TupleMap<string | Tile, ArrayBufferView> = new TupleMap();
+  public ixInTileBuffer: DS.BufferLocation;
+  // A list of integers. Used internally.
+  private _integer_array?: Float32Array;
+  // A buffer populated from that list.
+  private _integer_buffer?: Buffer;
+
+  constructor(renderer: ReglRenderer) {
+    this.regl = renderer.regl;
+    this.renderer = renderer;
+    // Reuse the same buffer for all `ix_in_tile` keys, because
+    // it's just a set of integers going up.
+    this.ixInTileBuffer = {
+      offset: 0,
+      stride: 4,
+      buffer: this.integer_buffer,
+      byte_size: 4 * 2 ** 16,
+    };
+  }
+
+  get integer_array(): Float32Array {
+    if (this._integer_array === undefined) {
+      this._integer_array = new Float32Array(2 ** 16);
+      for (let i = 0; i < 2 ** 16; i++) {
+        this._integer_array[i] = i;
+      }
+    }
+    return this._integer_array;
+  }
+
+  get integer_buffer(): wrapREGL.Buffer {
+    if (this._integer_buffer === undefined) {
+      const array = this.integer_array;
+      this._integer_buffer = this.regl.buffer(array);
+    }
+    return this._integer_buffer;
+  }
+
+  get(k: Some<string | Tile>): DS.BufferLocation | null {
+    const a = this.bufferMap.get(this.arrayMap.get(k));
+    return a;
+  }
+
+  /**
+   *
+   * @param
+   * @returns Is the buffer ready with all the requested aesthetics for the current plot?
+   */
+  ready(tile: Tile, needed_dimensions: Iterable<string[]>): boolean {
+    // We don't allocate buffers for dimensions until they're needed.
+    for (const keyset of [['ix'], ['ix_in_tile'], ...needed_dimensions] as Some<
+      string[]
+    >) {
+      const current = this.get([tile, ...keyset]);
+
+      if (current === null || current === undefined) {
+        if (tile.hasLoadedColumn(keyset[0])) {
+          this.create_regl_buffer(tile, keyset);
+        } else {
+          if (keyset[0] === 'ix_in_tile') {
+            this.create_regl_buffer(tile, keyset);
+          } else {
+            if (tile.readyToUse) {
+              // tile.get_column(keyset[0]);
+            } else {
+              // pass
+            }
+            return false;
+          }
+        }
+      }
+    }
+    return true;
+  }
+
+  /**
+   *
+   * @param colname the name of the column to release
+   *
+   * @returns Nothing, not even if the column isn't currently defined.
+   */
+  release(tile: Tile, colname: string[]): void {
+    const current = this.get([tile, ...colname]);
+    if (current) {
+      this.renderer.buffers.free_block(current);
+    }
+  }
+
+  /**
+   *
+   * @param tile the tile to use
+   * @param key the (nested?) key in the dataset. This must be already populated
+   * when this function is run.
+   * @returns A Float32-converted version of the data in the column
+   * suitable to be dropped onto a webGL buffer.
+   */
+  convertToGlFormat(column: Vector<DS.SupportedArrowTypes>): Float32Array {
+    // Anything that isn't a single-precision float must be coerced to one.
+    if (!column.type || column.type.typeId !== Type.Float32) {
+      // For numeric data, it's safe to simply return the data straight up.
+      if (column.data[0].values.constructor === Float64Array) {
+        return new Float32Array(column.data[0].values);
+      }
+
+      const buffer = new Float32Array(column.length);
+      const source_buffer = column.data[0];
+      if (column.type.typeId === Type.Dictionary) {
+        for (let i = 0; i < column.length; i++) {
+          buffer[i] = (source_buffer as Data<Dictionary<Utf8>>).values[i];
+        }
+      } else if (column.type.typeId === Type.Bool) {
+        // Booleans are unpacked using arrow fundamentals unless we see
+        // a reason to do it directly with bit operations (such as the null checks)
+        // being expensive.
+        for (let i = 0; i < column.length; i++) {
+          buffer[i] = column.get(i) ? 1 : 0;
+        }
+      } else if (
+        source_buffer.stride === 2 &&
+        column.type.typeId === Type.Timestamp
+      ) {
+        // 64-bit timestamped are internally represented as two 32-bit ints in the arrow arrays.
+        // This does a moderately expensive copy as a stopgap.
+        // This problem may creep up in other 64-bit types as we go, so keep an eye out.
+        const copy = new Int32Array(source_buffer.values).buffer;
+        const view64 = new BigInt64Array(copy);
+        const timetype = column.type.unit as number;
+        // All times are represented as milliseconds on the
+        // GPU to align with the Javascript numbers. More or less,
+        // at least.
+
+        const divisor =
+          timetype === 0
+            ? 1e-3 // second
+            : timetype === 1
+              ? 1 // millisecond
+              : timetype === 2
+                ? 1e3 // microsecond
+                : timetype === 3
+                  ? 1e6 // nanosecond
+                  : 42;
+        if (divisor === 42) {
+          throw new Error(`Unknown time type ${timetype}`);
+        }
+
+        for (let i = 0; i < column.length; i++) {
+          buffer[i] = Number(view64[i]) / divisor;
+        }
+      } else {
+        for (let i = 0; i < column.length; i++) {
+          buffer[i] = Number(source_buffer.values[i]);
+        }
+      }
+      return buffer;
+    }
+    return column.data[0].values as Float32Array;
+  }
+
+  create_regl_buffer(tile: Tile, keys: string[]): void {
+    const { renderer } = this;
+    const key = [tile, ...keys] as Some<string | Tile>;
+    if (this.arrayMap.has(key)) {
+      return;
+    }
+    if (keys[0] === 'ix_in_tile') {
+      this.arrayMap.set(key, this.integer_array);
+      if (!this.bufferMap.has(this.integer_array)) {
+        this.bufferMap.set(this.integer_array, this.ixInTileBuffer);
+      }
+      return;
+    }
+
+    const vector = getNestedVector(tile, keys);
+    this.arrayMap.set(key, vector.data[0].values);
+
+    if (this.bufferMap.has(vector.data[0].values)) {
+      return;
+    }
+
+    const data = this.convertToGlFormat(vector);
+    const item_size = 4;
+    const data_length = data.length;
+
+    const buffer_desc = renderer.buffers.allocate_block(data_length, item_size);
+
+    buffer_desc.buffer.subdata(data, buffer_desc.offset);
+
+    this.bufferMap.set(vector.data[0].values, buffer_desc);
+  }
+}
+
+// TODO: Build this out in next PR.
+export function getNestedVector(
+  tile: Tile,
+  key: string[],
+): Vector<DS.SupportedArrowTypes> {
+  if (!tile.hasLoadedColumn(key[0])) {
+    if (tile.deeptable.transformations[key[0]] !== undefined) {
+      throw new Error(
+        'Attempted to create buffer data on an unloaded transformation',
+      );
+    } else {
+      let col_names = [
+        ...tile.record_batch.schema.fields.map((d) => d.name),
+        ...Object.keys(tile.deeptable.transformations),
+      ];
+      if (!key[0].startsWith('_')) {
+        // Don't warn internal columns unless the user is in internal-column land.
+        col_names = col_names.filter((d) => !d.startsWith('_'));
+      }
+      throw new Error(
+        `Requested ${key.join('->')} but table only has columns ["${col_names.join(
+          '", "',
+        )}]"`,
+      );
+    }
+  }
+
+  let column: Vector<DS.SupportedArrowTypes> | Vector<Struct> =
+    tile.record_batch.getChild(key[0]);
+  for (const k of key.slice(1)) {
+    column = column.getChild(k);
+  }
+  if (column.data.length !== 1) {
+    throw new Error(
+      `Column ${key.join('->')} has ${column.data.length} buffers, not 1.`,
+    );
+  }
+
+  if (!column.type || !column.type.typeId) {
+    throw new Error(`Column ${key.join('->')} has no type.`);
+  }
+  function assertNotStruct(
+    value: Vector<DS.SupportedArrowTypes> | Vector<Struct>,
+  ): asserts value is Vector<DS.SupportedArrowTypes> {
+    if (column.type.typeId === Type.Struct) {
+      throw new Error(
+        'Structs are not supported for buffer data on column ' + key.join('->'),
+      );
+    }
+  }
+
+  assertNotStruct(column);
+  return column;
+}
+
+class MultipurposeBufferSet {
+  // An abstraction creating an expandable set of buffers that can be subdivided
+  // to put more than one variable on the same
+  // block of memory. Reusing buffers this way can have performance benefits over allocating
+  // multiple different buffers for each small block used.
+
+  // The general purpose here is to call 'allocate_block' that releases a block of memory
+  // to use in creating a new array to be passed to regl.
+
+  private regl: Regl;
+  private buffers: Buffer[];
+  public buffer_size: number;
+  private pointer: number; // the byte offset to start the next allocation from.
+  private freed_buffers: DS.BufferLocation[] = [];
+  /**
+   *
+   * @param regl the Regl context we're using.
+   * @param buffer_size The number of bytes on each strip of memory that we'll ask for.
+   */
+
+  constructor(regl: Regl, buffer_size: number) {
+    this.regl = regl;
+    this.buffer_size = buffer_size;
+    this.buffers = [];
+    // Track the ends in case we want to allocate smaller items.
+    this.pointer = 0;
+    this.generate_new_buffer();
+  }
+
+  generate_new_buffer() {
+    if (this.buffers.length && this.buffer_size - this.pointer > 128) {
+      // mark any remaining space longer than 128 bytes as available.
+      this.freed_buffers.push({
+        buffer: this.buffers[0],
+        offset: this.pointer,
+        stride: 4, // meaningless here.
+        byte_size: this.buffer_size - this.pointer,
+      });
+    }
+    this.pointer = 0;
+    // Adds to beginning of list.
+    this.buffers.unshift(
+      this.regl.buffer({
+        type: 'float',
+        length: this.buffer_size,
+        usage: 'dynamic',
+      }),
+    );
+  }
+  /**
+   * Freeing a block means just adding its space back into the list of open blocks.
+   * There's no need to actually zero out the memory or anything.
+   *
+   * @param buff The location of the buffer we're done with.
+   */
+  free_block(buff: DS.BufferLocation) {
+    this.freed_buffers.push(buff);
+  }
+
+  /**
+   *
+   * @param items The number of datapoints in the arrow column being allocated
+   * @param bytes_per_item The number of bytes per item in the arrow column being allocated
+   * @returns
+   */
+
+  allocate_block(items: number, bytes_per_item: number): DS.BufferLocation {
+    // Call dibs on a block of this buffer.
+    // NB size is in **bytes**
+    const bytes_needed = items * bytes_per_item;
+    let i = 0;
+    for (const buffer_loc of this.freed_buffers) {
+      // In practice, there should probably be a buffer of precisely the right size from
+      // the same recordbatch--so only reuse those so as not to slowly leak out memory
+      // by creating small unallocated strips at the end.
+      if (buffer_loc.byte_size === bytes_needed) {
+        // Delete this element from the list of free buffers.
+        this.freed_buffers.splice(i, 1);
+        const v = {
+          buffer: buffer_loc.buffer,
+          offset: buffer_loc.offset,
+          stride: bytes_per_item,
+          byte_size: bytes_needed,
+        };
+        return v;
+      }
+      i += 1;
+    }
+
+    if (this.pointer + items * bytes_per_item > this.buffer_size) {
+      // May lead to ragged ends. Could be smarter about reallocation here,
+      // too.
+      this.generate_new_buffer();
+    }
+
+    const value: DS.BufferLocation = {
+      // First slot stores the active buffer.
+      buffer: this.buffers[0],
+      offset: this.pointer,
+      stride: bytes_per_item,
+      byte_size: items * bytes_per_item,
+    };
+
+    this.pointer += items * bytes_per_item;
+    return value;
+  }
+}
+
+/**
+ *
+ * @param prefs The preferences object to be used.
+ *
+ * @returns The fields that need to be allocated in the buffers for
+ * a tile to be drawn. Returns a map of columns and any subfields in them that are needed.
+ */
+export function neededFieldsToPlot(
+  encoding: DS.Encoding | undefined,
+): TupleSet<string> {
+  const needed_keys = new TupleSet<string>([['ix']]);
+  if (!encoding) {
+    return needed_keys;
+  }
+  for (const [_, v] of Object.entries(encoding)) {
+    if (v && typeof v !== 'string' && v['field'] !== undefined) {
+      const needed_key: Some<string> = [v['field']];
+      if (v['subfield'] !== undefined) {
+        const subfield: string | string[] = v['subfield'] as string | string[];
+        const asArray = Array.isArray(subfield) ? [...subfield] : [subfield];
+        needed_key.push(...asArray);
+      }
+      needed_keys.add(needed_key);
+    }
+  }
+  return needed_keys;
+}
