@@ -10,6 +10,7 @@ import { LabelMaker } from './label_rendering';
 import { Renderer } from './rendering';
 import type { ConcreteAesthetic } from './aesthetics/StatefulAesthetic';
 import { isURLLabels, isLabelset } from './typing';
+import { WebGPURenderer } from './webgpu_rendering';
 import { DataSelection } from './selection';
 import type {
   BooleanColumnParams,
@@ -29,10 +30,10 @@ const base_elements = [
     id: 'webgl-canvas',
     nodetype: 'canvas',
   },
-  {
-    id: 'webgpu-canvas',
-    nodetype: 'canvas',
-  },
+  // {
+  //   id: 'webgpu-canvas',     **to implement later**
+  //   nodetype: 'canvas',
+  // },
   {
     id: 'canvas-2d',
     nodetype: 'canvas',
@@ -53,6 +54,7 @@ type Hook = () => void;
  */
 export class Scatterplot {
   public _renderer?: ReglRenderer; //| WebGPURenderer;
+  private wgpuRenderer: WebGPURenderer;
   public width: number;
   public height: number;
   public _root?: Deeptable;
@@ -392,25 +394,52 @@ export class Scatterplot {
     return this._root;
   }
 
+  private async initializeWebGPUStarter() {
+    try {
+      await this.wgpuRenderer.initialize();
+      this.setupWgpuResizeHandler();
+      this.startWgpuRenderLoop();
+    } catch (error) {
+      console.error('Failed to initialize WebGPU:', error);
+    }
+  }
+
+  private setupWgpuResizeHandler() {
+    window.addEventListener('resize', () => {
+      this.wgpuRenderer.resize(window.innerWidth, window.innerHeight);
+    });
+  }
+
+  private startWgpuRenderLoop() {
+    const render = () => {
+      this.wgpuRenderer.render();
+      requestAnimationFrame(render);
+    };
+    render();
+  }
+
   async reinitialize() {
     const { prefs } = this;
     await this.deeptable.promise;
     await this.deeptable.root_tile.get_column('x');
 
-    //  check rendering mode or default to webgl
-    if (prefs.rendering_mode !== 'webgpu') {
-      this._renderer = new ReglRenderer(
-        '#container-for-webgl-canvas',
-        this.deeptable,
-        this,
-      );
-    } else {
-      // this._renderer = new WebGPURenderer(
-      //   '#container-for-webgpu-canvas',
-      //   this.deeptable,
-      //   this,
-      // );
+    // shoehorning webgpu to start
+    if (prefs.rendering_mode === 'webgpu') {
+      const canvas = document.createElement('canvas');
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      document.body.appendChild(canvas);
+
+      this.wgpuRenderer = new WebGPURenderer(canvas);
+      this.initializeWebGPUStarter();
+      return;
     }
+
+    this._renderer = new ReglRenderer(
+      '#container-for-webgl-canvas',
+      this.deeptable,
+      this,
+    );
 
     this._zoom = new Zoom('#deepscatter-svg', this.prefs, this);
     this._zoom.attach_tiles(this.deeptable);
@@ -899,7 +928,6 @@ abstract class SettableFunction<FuncType, ArgType = StructRowProxy> {
 
 import type { GeoJsonProperties } from 'geojson';
 import { default_API_call } from './defaults';
-import { WebGPURenderer } from './webgpu_rendering';
 
 class LabelClick extends SettableFunction<void, GeoJsonProperties> {
   default(
