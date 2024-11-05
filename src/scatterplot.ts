@@ -10,7 +10,7 @@ import { LabelMaker } from './label_rendering';
 import { Renderer } from './rendering';
 import type { ConcreteAesthetic } from './aesthetics/StatefulAesthetic';
 import { isURLLabels, isLabelset } from './typing';
-import { WebGPURenderer } from './webgpu_rendering';
+import { WebGPURenderer } from './webgpu/webgpu_sample';
 import { DataSelection } from './selection';
 import type {
   BooleanColumnParams,
