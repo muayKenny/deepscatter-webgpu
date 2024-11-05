@@ -1,4 +1,4 @@
-class Vec2 {
+export class Vec2 {
   x: number;
   y: number;
 
@@ -12,11 +12,11 @@ class Vec2 {
   }
 }
 
-interface Point {
+export interface Point {
   position: Vec2;
 }
 
-export class WebGPUPointRenderer {
+export class WebGPURenderer {
   private canvas: HTMLCanvasElement;
   private device: GPUDevice;
   private context: GPUCanvasContext;
@@ -76,7 +76,7 @@ export class WebGPUPointRenderer {
 
         @fragment
         fn fragmentMain() -> @location(0) vec4f {
-          return vec4f(1.0, 0.0, 0.0, 1.0); // Red points
+          return vec4f(1.0, 1.0, 1.0, 1.0); // white points
         }
       `,
     });
@@ -122,10 +122,10 @@ export class WebGPUPointRenderer {
     // Create and fill vertex buffer
     const vertexData = new Float32Array(points.length * 2);
     points.forEach((point, i) => {
-      vertexData[i * 2] = point.position[0];
-      vertexData[i * 2 + 1] = point.position[1];
+      vertexData[i * 2] = point.position.x;
+      vertexData[i * 2 + 1] = point.position.y;
     });
-
+    console.log(points);
     this.vertexBuffer = this.device.createBuffer({
       label: 'Point vertices',
       size: vertexData.byteLength,
@@ -159,11 +159,17 @@ export class WebGPUPointRenderer {
     renderPass.setPipeline(this.pipeline);
     renderPass.setVertexBuffer(0, this.vertexBuffer);
 
+    console.log(this.pointData.length);
     // Draw points
     renderPass.draw(this.pointData.length, 1, 0, 0);
 
     // End render pass and submit commands
     renderPass.end();
     this.device.queue.submit([commandEncoder.finish()]);
+  }
+
+  resize(width: number, height: number): void {
+    this.canvas.width = width;
+    this.canvas.height = height;
   }
 }

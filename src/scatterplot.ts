@@ -10,7 +10,9 @@ import { LabelMaker } from './label_rendering';
 import { Renderer } from './rendering';
 import type { ConcreteAesthetic } from './aesthetics/StatefulAesthetic';
 import { isURLLabels, isLabelset } from './typing';
-import { WebGPURenderer } from './webgpu/webgpu_sample';
+// import { WebGPURenderer } from './webgpu/webgpu_sample';
+import { Point, Vec2, WebGPURenderer } from './webgpu/webgpu_rendering';
+
 import { DataSelection } from './selection';
 import type {
   BooleanColumnParams,
@@ -398,6 +400,19 @@ export class Scatterplot {
     try {
       await this.wgpuRenderer.initialize();
       this.setupWgpuResizeHandler();
+      const numPoints = 1000; // Number of points
+
+      // Generate random points within [-1, 1] for both x and y
+      const samplePoints: Point[] = [];
+      for (let i = 0; i < numPoints; i++) {
+        const x = Math.random() * 2 - 1; // Random between -1 and 1
+        const y = Math.random() * 2 - 1; // Random between -1 and 1
+        samplePoints.push({ position: new Vec2(x, y) });
+      }
+
+      // comment out line to see webgpu_sample
+      this.wgpuRenderer.setData(samplePoints);
+
       this.startWgpuRenderLoop();
     } catch (error) {
       console.error('Failed to initialize WebGPU:', error);
