@@ -2,6 +2,8 @@ node_modules
 public/tiles
 .vscode
 
+venv
+tmp.csv
 dist/tiles
 test-results/
 playwright-report/

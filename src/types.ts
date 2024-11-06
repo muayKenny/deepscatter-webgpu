@@ -589,6 +589,7 @@ export type InitialAPICall = APICall & {
 // A full API call includes all of these.
 // Encoding settings are not described here.
 export type CompletePrefs = APICall & {
+  rendering_mode?: undefined | 'webgl' | 'webgpu';
   background_options: {
     color: string;
     opacity: [number, number];
