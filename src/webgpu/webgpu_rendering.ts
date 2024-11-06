@@ -22,14 +22,15 @@ export class WebGPURenderer {
   private context: GPUCanvasContext;
   private pipeline: GPURenderPipeline;
   private vertexBuffer: GPUBuffer;
-  private pointData: Point[] = [];
+  // private pointData: Point[] = [];
+  private vertexCount: number = 0; // Add this to track vertex count
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
   }
 
   async initialize() {
-    // Get WebGPU adapter and device
+    // Previous initialization code remains the same...
     if (!navigator.gpu) {
       throw new Error('WebGPU not supported');
     }
@@ -47,15 +48,20 @@ export class WebGPURenderer {
       throw new Error('Failed to get WebGPU context');
     }
 
-    const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
-
+    const format = navigator.gpu.getPreferredCanvasFormat();
     this.context.configure({
       device: this.device,
-      format: canvasFormat,
+      format,
       alphaMode: 'premultiplied',
     });
 
-    // Create shader
+    await this.createPipeline(format);
+  }
+
+  private async createPipeline(format: GPUTextureFormat): Promise<void> {
+    if (!this.device) throw new Error('Device not initialized');
+
+    // Modified shader with debug colors based on position
     const shaderModule = this.device.createShaderModule({
       label: 'Point shader',
       code: `
@@ -65,23 +71,33 @@ export class WebGPURenderer {
 
         struct VertexOutput {
           @builtin(position) position: vec4f,
+          @location(0) color: vec4f,
         };
 
         @vertex
         fn vertexMain(input: VertexInput) -> VertexOutput {
           var output: VertexOutput;
           output.position = vec4f(input.position, 0.0, 1.0);
+          
+          // Debug coloring based on position
+          output.color = vec4f(
+            (input.position.x + 1.0) / 2.0,  // R: x mapped to 0-1
+            (input.position.y + 1.0) / 2.0,  // G: y mapped to 0-1
+            0.5,                             // B: constant
+            1.0                              // A: constant
+          );
+          
           return output;
         }
 
         @fragment
-        fn fragmentMain() -> @location(0) vec4f {
-          return vec4f(1.0, 1.0, 1.0, 1.0); // white points
+        fn fragmentMain(@location(0) color: vec4f) -> @location(0) vec4f {
+          return color; // Use interpolated color from vertex shader
         }
       `,
     });
 
-    // Create render pipeline
+    // Modified pipeline to include color output
     this.pipeline = this.device.createRenderPipeline({
       label: 'Point pipeline',
       layout: 'auto',
@@ -106,65 +122,82 @@ export class WebGPURenderer {
         entryPoint: 'fragmentMain',
         targets: [
           {
-            format: canvasFormat,
+            format: format,
+            blend: {
+              color: {
+                srcFactor: 'src-alpha',
+                dstFactor: 'one-minus-src-alpha',
+                operation: 'add',
+              },
+              alpha: {
+                srcFactor: 'one',
+                dstFactor: 'one-minus-src-alpha',
+                operation: 'add',
+              },
+            },
           },
         ],
       },
       primitive: {
         topology: 'point-list',
+        // Add point size
+        stripIndexFormat: undefined,
       },
     });
   }
 
-  setData(points: Point[]) {
-    this.pointData = points;
+  setDataArray(points: Float32Array) {
+    if (!points || points.length === 0) {
+      console.error('Received empty or null points array');
+      return;
+    }
 
-    // Create and fill vertex buffer
-    const vertexData = new Float32Array(points.length * 2);
-    points.forEach((point, i) => {
-      vertexData[i * 2] = point.position.x;
-      vertexData[i * 2 + 1] = point.position.y;
-    });
-    console.log(points);
+    // Debug logging
+    this.vertexCount = points.length / 2;
+    console.log(`Setting up ${this.vertexCount} vertices`);
+    console.log(
+      'First few points:',
+      Array.from(points.slice(0, Math.min(10, points.length)))
+        .map((v, i) => (i % 2 === 0 ? `\n(${v},` : `${v})`))
+        .join(''),
+    );
+
+    const bufferSize = points.byteLength;
     this.vertexBuffer = this.device.createBuffer({
       label: 'Point vertices',
-      size: vertexData.byteLength,
+      size: bufferSize,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
 
-    this.device.queue.writeBuffer(this.vertexBuffer, 0, vertexData);
+    this.device.queue.writeBuffer(this.vertexBuffer, 0, points);
   }
 
   render() {
-    // Get the current texture from the canvas context
+    if (!this.vertexBuffer || this.vertexCount === 0) {
+      console.warn('No vertices to render');
+      return;
+    }
+
+    const commandEncoder = this.device.createCommandEncoder();
     const colorTexture = this.context.getCurrentTexture();
     const colorView = colorTexture.createView();
 
-    // Create command encoder
-    const commandEncoder = this.device.createCommandEncoder();
-
-    // Begin render pass
     const renderPass = commandEncoder.beginRenderPass({
       colorAttachments: [
         {
           view: colorView,
-          clearValue: { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+          clearValue: { r: 0.0, g: 0.0, b: 0.1, a: 1.0 }, // Slightly blue background
           loadOp: 'clear',
           storeOp: 'store',
         },
       ],
     });
 
-    // Set pipeline and vertex buffer
     renderPass.setPipeline(this.pipeline);
     renderPass.setVertexBuffer(0, this.vertexBuffer);
-
-    console.log(this.pointData.length);
-    // Draw points
-    renderPass.draw(this.pointData.length, 1, 0, 0);
-
-    // End render pass and submit commands
+    renderPass.draw(this.vertexCount, 1, 0, 0);
     renderPass.end();
+
     this.device.queue.submit([commandEncoder.finish()]);
   }
 

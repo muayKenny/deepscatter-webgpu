@@ -400,18 +400,26 @@ export class Scatterplot {
     try {
       await this.wgpuRenderer.initialize();
       this.setupWgpuResizeHandler();
-      const numPoints = 1000; // Number of points
 
       // Generate random points within [-1, 1] for both x and y
-      const samplePoints: Point[] = [];
-      for (let i = 0; i < numPoints; i++) {
-        const x = Math.random() * 2 - 1; // Random between -1 and 1
-        const y = Math.random() * 2 - 1; // Random between -1 and 1
-        samplePoints.push({ position: new Vec2(x, y) });
-      }
+      // const numPoints = 1000; // Number of points
+      // const samplePoints: Point[] = [];
+      // for (let i = 0; i < numPoints; i++) {
+      //   const x = Math.random() * 2 - 1; // Random between -1 and 1
+      //   const y = Math.random() * 2 - 1; // Random between -1 and 1
+      //   samplePoints.push({ position: new Vec2(x, y) });
+      // }
 
       // comment out line to see webgpu_sample
-      this.wgpuRenderer.setData(samplePoints);
+      // this.wgpuRenderer.setData(samplePoints);
+
+      const shallow = new ShallowTable(this.deeptable);
+      await shallow.collectPoints();
+
+      // Get points as array for WebGPU
+      const pointArray = shallow.getNormalizedPointsArray();
+
+      this.wgpuRenderer.setDataArray(pointArray);
 
       this.startWgpuRenderLoop();
     } catch (error) {
@@ -943,6 +951,7 @@ abstract class SettableFunction<FuncType, ArgType = StructRowProxy> {
 
 import type { GeoJsonProperties } from 'geojson';
 import { default_API_call } from './defaults';
+import { ShallowTable } from './webgpu/ShallowTable';
 
 class LabelClick extends SettableFunction<void, GeoJsonProperties> {
   default(
