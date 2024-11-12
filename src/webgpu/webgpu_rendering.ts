@@ -61,38 +61,70 @@ export class WebGPURenderer {
   private async createPipeline(format: GPUTextureFormat): Promise<void> {
     if (!this.device) throw new Error('Device not initialized');
 
-    // Modified shader with debug colors based on position
     const shaderModule = this.device.createShaderModule({
       label: 'Point shader',
       code: `
         struct VertexInput {
           @location(0) position: vec2f,
         };
-
+    
         struct VertexOutput {
           @builtin(position) position: vec4f,
           @location(0) color: vec4f,
+          @location(1) uv: vec2f,
         };
-
-        @vertex
-        fn vertexMain(input: VertexInput) -> VertexOutput {
+    
+       @vertex
+        fn vertexMain(input: VertexInput, @builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
           var output: VertexOutput;
-          output.position = vec4f(input.position, 0.0, 1.0);
           
-          // Debug coloring based on position
+          // Make size much smaller
+          let size = 0.005;  // reduced from 0.02
+          
+          // Vertex indices 0-5 for each point
+          let vertexInQuad = vertexIndex % 6u;
+          
+          let corners = array<vec2f, 6>(
+            vec2f(-1.0, -1.0),  
+            vec2f( 1.0, -1.0),
+            vec2f( 1.0,  1.0),
+            vec2f(-1.0, -1.0),  
+            vec2f( 1.0,  1.0),
+            vec2f(-1.0,  1.0)
+          );
+          
+          let corner = corners[vertexInQuad];
+          
+          let worldPos = input.position;
+          let offset = corner * size;
+          output.position = vec4f(worldPos + offset, 0.0, 1.0);
+          
+          output.uv = corner;
           output.color = vec4f(
-            (input.position.x + 1.0) / 2.0,  // R: x mapped to 0-1
-            (input.position.y + 1.0) / 2.0,  // G: y mapped to 0-1
-            0.5,                             // B: constant
-            1.0                              // A: constant
+            (input.position.x + 1.0) / 2.0,
+            (input.position.y + 1.0) / 2.0,
+            0.5,
+            1.0
           );
           
           return output;
         }
-
+    
         @fragment
-        fn fragmentMain(@location(0) color: vec4f) -> @location(0) vec4f {
-          return color; // Use interpolated color from vertex shader
+        fn fragmentMain(
+          @location(0) color: vec4f,
+          @location(1) uv: vec2f
+        ) -> @location(0) vec4f {
+          let dist = length(uv);
+          
+          if (dist > 1.0) {
+            discard;
+          }
+          
+          let smoothing = .7;
+          let alpha = 1.0 - smoothstep(1.0 - smoothing, 1.0, dist);
+          
+          return vec4f(color.rgb, color.a * alpha);
         }
       `,
     });
@@ -139,7 +171,7 @@ export class WebGPURenderer {
         ],
       },
       primitive: {
-        topology: 'point-list',
+        topology: 'triangle-list',
         // Add point size
         stripIndexFormat: undefined,
       },
@@ -152,24 +184,37 @@ export class WebGPURenderer {
       return;
     }
 
-    // Debug logging
-    this.vertexCount = points.length / 2;
-    console.log(`Setting up ${this.vertexCount} vertices`);
-    console.log(
-      'First few points:',
-      Array.from(points.slice(0, Math.min(10, points.length)))
-        .map((v, i) => (i % 2 === 0 ? `\n(${v},` : `${v})`))
-        .join(''),
-    );
+    const numPoints = points.length / 2;
+    this.vertexCount = numPoints * 6; // 6 vertices per point
 
-    const bufferSize = points.byteLength;
+    const vertexData = new Float32Array(numPoints * 6 * 2);
+
+    console.log('Number of input points:', numPoints);
+    console.log('Creating vertex buffer with size:', vertexData.length);
+
+    for (let i = 0; i < numPoints; i++) {
+      const x = points[i * 2];
+      const y = points[i * 2 + 1];
+
+      if (i % 100 === 0) {
+        console.log(`Processing point ${i}: (${x}, ${y})`);
+        console.log(`Writing to indices ${i * 12} through ${i * 12 + 11}`);
+      }
+
+      for (let j = 0; j < 6; j++) {
+        vertexData[i * 12 + j * 2] = x;
+        vertexData[i * 12 + j * 2 + 1] = y;
+      }
+    }
+
+    const bufferSize = vertexData.byteLength;
     this.vertexBuffer = this.device.createBuffer({
       label: 'Point vertices',
       size: bufferSize,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
 
-    this.device.queue.writeBuffer(this.vertexBuffer, 0, points);
+    this.device.queue.writeBuffer(this.vertexBuffer, 0, vertexData);
   }
 
   render() {
