@@ -1,3 +1,24 @@
+# Fork Description
+
+This fork aims to add a WebGPU rendering option accessible by passing a new pref:
+
+The approach is designed with WebGPU as the default renderer, with an automatic fallback to WebGL when WebGPU is not supported (`!navigator.gpu`).
+`rendering_mode?: undefined | 'webgl' | 'webgpu';`
+
+## Current Status
+
+- **Proof of concept** implemented in `index-simplest-way-to-start.html`
+- **Basic WebGPU circle rendering** using data from Deeptable
+- Currently using a simplified data structure **Shallowtable** to extract x/y coordinates from `tile.record_batch` rows
+- Initial focus was on establishing the WebGPU rendering pipeline
+
+## Next Steps
+
+- Determine optimal data representation for rendering
+- [x] Improve point cloud rendering to circles via quad corner cutting
+- Expand WebGPU implementation beyond basic point rendering
+- Implement automatic WebGL fallback
+
 # Deep Scatterplots for the Web
 
 This is a library for allowing interactive visualization of extremely large datasets, in browser.
