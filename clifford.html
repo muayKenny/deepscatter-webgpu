@@ -2,7 +2,7 @@
   <div id="deepscatter"></div>
 </body>
 <script type="module">
-  import Scatterplot from './src/deepscatter';
+  import { Scatterplot } from './src/deepscatter';
   import { tableFromArrays, Table } from 'apache-arrow';
 
   let batch_no = 0;
@@ -17,7 +17,7 @@
       y0: 0,
     },
     center,
-    n_batches
+    n_batches,
   ) {
     // this is a function to create an apache arrow table based on a
     // set of constants and a Clifford attractor. See https://observablehq.com/@mbostock/clifford-attractor.
@@ -78,7 +78,7 @@
       y0: 0,
     },
     [1, -1],
-    4
+    4,
   );
 
   const t2 = attractor(
@@ -91,7 +91,7 @@
       y0: 0,
     },
     [-1, 1],
-    96
+    96,
   );
 
   const table = t1.concat(t2);

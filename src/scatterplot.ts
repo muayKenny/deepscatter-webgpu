@@ -10,6 +10,9 @@ import { LabelMaker } from './label_rendering';
 import { Renderer } from './rendering';
 import type { ConcreteAesthetic } from './aesthetics/StatefulAesthetic';
 import { isURLLabels, isLabelset } from './typing';
+// import { WebGPURenderer } from './webgpu/webgpu_sample';
+import { Point, Vec2, WebGPURenderer } from './webgpu/webgpu_rendering';
+
 import { DataSelection } from './selection';
 import type {
   BooleanColumnParams,
@@ -29,6 +32,10 @@ const base_elements = [
     id: 'webgl-canvas',
     nodetype: 'canvas',
   },
+  // {
+  //   id: 'webgpu-canvas',     **to implement later**
+  //   nodetype: 'canvas',
+  // },
   {
     id: 'canvas-2d',
     nodetype: 'canvas',
@@ -48,7 +55,8 @@ type Hook = () => void;
  * all data and renderering.
  */
 export class Scatterplot {
-  public _renderer?: ReglRenderer;
+  public _renderer?: ReglRenderer; //| WebGPURenderer;
+  private wgpuRenderer: WebGPURenderer;
   public width: number;
   public height: number;
   public _root?: Deeptable;
@@ -388,15 +396,74 @@ export class Scatterplot {
     return this._root;
   }
 
+  private async initializeWebGPUStarter() {
+    try {
+      await this.wgpuRenderer.initialize();
+      this.setupWgpuResizeHandler();
+
+      // Generate random points within [-1, 1] for both x and y
+      // const numPoints = 1000; // Number of points
+      // const samplePoints: Point[] = [];
+      // for (let i = 0; i < numPoints; i++) {
+      //   const x = Math.random() * 2 - 1; // Random between -1 and 1
+      //   const y = Math.random() * 2 - 1; // Random between -1 and 1
+      //   samplePoints.push({ position: new Vec2(x, y) });
+      // }
+
+      // comment out line to see webgpu_sample
+      // this.wgpuRenderer.setData(samplePoints);
+
+      const shallow = new ShallowTable(this.deeptable);
+      await shallow.collectPoints();
+
+      // Get points as array for WebGPU
+      const pointArray = shallow.getNormalizedPointsArray();
+
+      this.wgpuRenderer.setDataArray(pointArray);
+
+      this.startWgpuRenderLoop();
+    } catch (error) {
+      console.error('Failed to initialize WebGPU:', error);
+    }
+  }
+
+  private setupWgpuResizeHandler() {
+    window.addEventListener('resize', () => {
+      this.wgpuRenderer.resize(window.innerWidth, window.innerHeight);
+    });
+  }
+
+  private startWgpuRenderLoop() {
+    const render = () => {
+      this.wgpuRenderer.render();
+      requestAnimationFrame(render);
+    };
+    render();
+  }
+
   async reinitialize() {
     const { prefs } = this;
     await this.deeptable.promise;
     await this.deeptable.root_tile.get_column('x');
+
+    // shoehorning webgpu to start
+    if (prefs.rendering_mode === 'webgpu') {
+      const canvas = document.createElement('canvas');
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      document.body.appendChild(canvas);
+
+      this.wgpuRenderer = new WebGPURenderer(canvas);
+      this.initializeWebGPUStarter();
+      return;
+    }
+
     this._renderer = new ReglRenderer(
       '#container-for-webgl-canvas',
       this.deeptable,
       this,
     );
+
     this._zoom = new Zoom('#deepscatter-svg', this.prefs, this);
     this._zoom.attach_tiles(this.deeptable);
     this._zoom.attach_renderer('regl', this._renderer);
@@ -629,6 +696,7 @@ export class Scatterplot {
   /**
    * Plots a set of prefs, and returns a promise that resolves
    * upon the completion of the plot (not including any time for transitions).
+   * now with 'webGPU' rendering option // work in progress
    */
   async plotAPI(prefs: DS.APICall): Promise<void> {
     if (prefs === undefined) {
@@ -665,7 +733,6 @@ export class Scatterplot {
     }
     return;
   }
-
   /**
    * Get a short head start on transformations. This prevents a flicker
    * when a new data field needs to be loaded onto the GPU.
@@ -884,6 +951,7 @@ abstract class SettableFunction<FuncType, ArgType = StructRowProxy> {
 
 import type { GeoJsonProperties } from 'geojson';
 import { default_API_call } from './defaults';
+import { ShallowTable } from './webgpu/ShallowTable';
 
 class LabelClick extends SettableFunction<void, GeoJsonProperties> {
   default(

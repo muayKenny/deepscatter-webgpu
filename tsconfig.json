@@ -11,6 +11,7 @@
     "experimentalDecorators": true,
     "sourceMap": true,
     "strict": false,
+    "types": ["@webgpu/types"],
     "target": "es2020",
     "isolatedModules": true,
     "outDir": "./dist",
